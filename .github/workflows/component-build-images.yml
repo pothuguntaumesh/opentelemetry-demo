@@ -177,7 +177,8 @@ jobs:
           buildkitd-config-inline: |
             [worker.oci]
             max-parallelism = 2
-            - name: Matrix Build and push demo images
+      - name: Matrix Build and push demo images
+        if: steps.check_changes.outputs.skip == 'false'
         uses: docker/build-push-action@v6.10.0
         with:
           context: ${{ matrix.file_tag.context }}
