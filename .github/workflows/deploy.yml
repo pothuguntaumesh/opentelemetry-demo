@@ -1,83 +1,80 @@
-# Copyright The OpenTelemetry Authors
-# SPDX-License-Identifier: Apache-2.0
-name: CI/CD for Microservices
+name: Deploy to EKS
+
 on:
-  push:
-    branches:
-      - main # Trigger on pushes to the main branch
-  pull_request:
-    branches:
-      - main # Trigger on pull requests to the main branch
+  workflow_run:
+    workflows: ["Integration Tests"]
+    types:
+      - completed
 
 jobs:
-  build-and-deploy:
-    name: Build and Deploy Microservices
+  deploy-to-eks:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        service:
-          - accountingservice
-          - adservice
-          - catservice
-          - checkoutservice
-          - currencyservice
-          - emailservice
-          - flagd-ui
-          - flagd
-          - frauddetectionservice
-          - frontend
-          - frontendproxy
-          - grafana
-          - imageprovider
-          - kafka
-          - loadgenerator
-          - otelcollector
-          - paymentservice
-          - productcatalogservice
-          - prometheus
-          - quoteservice
-          - recommendationservice
-          - shippingservice
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
-      # Step 1: Checkout code
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # Step 2: Log in to Container Registry (GitHub Container Registry or ECR)
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
         with:
-          registry: ghcr.io
-          username: ${{ secrets.GHCR_USERNAME}}
-          password: ${{ secrets.GHCR_PAT }}
+          version: v3.14.4
 
-      # Step 3: Build Docker Image
-      - name: Build Docker Image for ${{ matrix.service }}
+      - name: Generate Kubernetes Manifest
         run: |
-          docker build -t ghcr.io/${{ github.repository }}/${{ matrix.service }}:latest ./src/${{ matrix.service }}
+          make generate-kubernetes-manifests
 
-      # Step 4: Push Docker Image
-      - name: Push Docker Image for ${{ matrix.service }}
-        run: |
-          docker push ghcr.io/${{ github.repository }}/${{ matrix.service }}:latest
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - name: Copy Manifest to EC2 Instance
+        uses: appleboy/scp-action@v0.1.2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET }}
-          aws-region: us-east-1
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "./kubernetes/opentelemetry-demo.yaml"
+          target: "/home/ubuntu/"
 
-      - name: Set up kubeconfig
-        run: |
-          aws eks update-kubeconfig --name otel-demo-project10 --region us-east-1
-      # Step 5: Deploy to Kubernetes
-      - name: Deploy to Kubernetes
-        uses: azure/k8s-deploy@v4
+      - name: Apply Manifest Using Kubectl on EC2
+        uses: appleboy/ssh-action@v0.1.3
         with:
-          namespace: otel-demo
-          manifests: |
-            ./k8s/deployment-${{ matrix.service }}.yaml
-          images: ghcr.io/${{ github.repository }}/${{ matrix.service }}:latest
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Backup existing manifest
+            if [ -f /home/ubuntu/kubernetes/opentelemetry-demo.yaml ]; then
+              cp /home/ubuntu/kubernetes/opentelemetry-demo.yaml /home/ubuntu/kubernetes/opentelemetry-demo-backup.yaml
+            fi
+
+            # Apply new manifest
+            KUBECONFIG="/home/ubuntu/.kube/config" kubectl apply --namespace otel-demo -f /home/ubuntu/kubernetes/opentelemetry-demo.yaml
+
+            # Wait for deployment to complete
+            KUBECONFIG="/home/ubuntu/.kube/config" kubectl rollout status deployment/opentelemetry-demo-frontend -n otel-demo --timeout=30s
+
+      - name: Monitor Deployment and Rollback if Necessary
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Wait for 5 minutes
+            sleep 30
+
+            # Check for unhealthy pods
+            UNHEALTHY_PODS=$(kubectl get pods -n otel-demo --field-selector=status.phase!=Running --no-headers 2> /dev/null | wc -l)
+            if [ "$UNHEALTHY_PODS" -ne 0 ]; then
+              echo "Detected issues with deployment. Rolling back..."
+              # Restore previous manifest
+              if [ -f /home/ubuntu/kubernetes/opentelemetry-demo-backup.yaml ]; then
+                kubectl apply -f /home/ubuntu/kubernetes/opentelemetry-demo-backup.yaml
+              else
+                echo "No backup manifest found. Cannot rollback."
+                exit 1
+              fi
+            else
+              echo "Deployment is healthy."
+            fi
