@@ -14,11 +14,6 @@ on:
         default: "dev"
         required: false
         type: string
-      dockerhub_repo:
-        description: Docker Hub repository
-        default: "otel/demo"
-        required: false
-        type: string
       ghcr_repo:
         description: GHCR repository
         default: "ghcr.io/pothuguntaumesh/demo"
@@ -150,21 +145,25 @@ jobs:
       - name: Check for changes and set push options
         id: check_changes
         run: |
-          echo "Forcing image build and push."
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to the Container registry
+          DOCKERFILE_DIR=$(dirname ${{ matrix.file_tag.file }})
+          FILES_CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} -- $DOCKERFILE_DIR)
+          FORCE_PUSH=${{ inputs.push }}
+          if [ "$FORCE_PUSH" = true ]; then
+            echo "Force push is enabled, proceeding with build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$FILES_CHANGED" ]; then
+            echo "No changes in ${{ matrix.file_tag.context }}, skipping build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changes detected in ${{ matrix.file_tag.context }}, proceeding with build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-        if: ${{ inputs.push }}
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
         if: ${{ inputs.push }}
       - name: Set up QEMU
         if: ${{ matrix.file_tag.setup-qemu }}
@@ -177,21 +176,19 @@ jobs:
           buildkitd-config-inline: |
             [worker.oci]
             max-parallelism = 2
-      - name: Matrix Build and push demo images
+      - name: Build and push images to GHCR
         if: steps.check_changes.outputs.skip == 'false'
         uses: docker/build-push-action@v6.10.0
         with:
           context: ${{ matrix.file_tag.context }}
           file: ${{ matrix.file_tag.file }}
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ inputs.push }}
           build-args: |
             OTEL_JAVA_AGENT_VERSION=${{ env.OTEL_JAVA_AGENT_VERSION }}
             OPENTELEMETRY_CPP_VERSION=${{ env.OPENTELEMETRY_CPP_VERSION }}
             TRACETEST_IMAGE_VERSION=${{ env.TRACETEST_IMAGE_VERSION }}
           tags: |
-            ${{ inputs.dockerhub_repo }}:${{ inputs.version }}-${{matrix.file_tag.tag_suffix }}
-            ${{ inputs.dockerhub_repo }}:latest-${{matrix.file_tag.tag_suffix }}
             ${{ inputs.ghcr_repo }}:${{ inputs.version }}-${{ matrix.file_tag.tag_suffix }}
             ${{ inputs.ghcr_repo }}:latest-${{ matrix.file_tag.tag_suffix }}
           cache-from: type=gha
